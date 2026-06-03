@@ -1,0 +1,99 @@
+import uvicorn
+from mcp.server import Server
+import mcp.types as types
+from mcp.server.sse import SseServerTransport
+from duckduckgo_search import DDGS
+
+# 1. Inicializar el servidor MCP básico
+server = Server("gemma-duckduckgo-search")
+
+@server.list_tools()
+async def list_tools():
+    return [
+        types.Tool(
+            name="web_search",
+            description="Busca en internet en tiempo real usando DuckDuckGo.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string", "description": "La consulta o palabras clave a buscar"}
+                },
+                "required": ["query"]
+            }
+        )
+    ]
+
+@server.call_tool()
+async def call_tool(name: str, arguments: dict):
+    if name != "web_search":
+        raise ValueError(f"Herramienta no encontrada: {name}")
+    
+    query = arguments.get("query", "")
+    try:
+        with DDGS() as ddgs:
+            results = [r for r in ddgs.text(query, max_results=5)]
+        
+        formatted = []
+        for r in results:
+            formatted.append(f"Título: {r.get('title')}\nEnlace: {r.get('href')}\nResumen: {r.get('body')}\n---")
+        
+        return [types.TextContent(type="text", text="\n".join(formatted))]
+    except Exception as e:
+        return [types.TextContent(type="text", text=f"Error al conectar con la red: {str(e)}")]
+
+# 2. Instanciar el transporte SSE nativo
+sse = SseServerTransport("/messages")
+
+# 3. Aplicación ASGI con interceptor de CORS y Buffering para Hugging Face
+async def app(scope, receive, send):
+    async def cors_send(event):
+        if event["type"] == "http.response.start":
+            headers = event.get("headers", [])
+            # Inyectar cabeceras críticas para evitar bloqueos en la app móvil
+            headers.append([b"access-control-allow-origin", b"*"])
+            headers.append([b"access-control-allow-methods", b"GET, POST, OPTIONS"])
+            headers.append([b"access-control-allow-headers", b"*"])
+            headers.append([b"x-accel-buffering", b"no"]) # Evita que Hugging Face retenga los datos en caché
+            event["headers"] = headers
+        await send(event)
+
+    if scope["type"] == "http":
+        path = scope["path"]
+        method = scope.get("method", "GET")
+        
+        if method == "OPTIONS":
+            await cors_send({
+                "type": "http.response.start",
+                "status": 204,
+                "headers": []
+            })
+            await cors_send({"type": "http.response.body", "body": b""})
+            return
+
+        if path == "/sse":
+            async with sse.connect_sse(scope, receive, cors_send) as streams:
+                await server.run(
+                    streams[0],
+                    streams[1],
+                    server.create_initialization_options()
+                )
+        elif path == "/messages":
+            await sse.handle_post_message(scope, receive, cors_send)
+        elif path == "/":
+            # Responder 200 OK en la raíz para validar la salud del servidor
+            await cors_send({
+                "type": "http.response.start",
+                "status": 200,
+                "headers": [[b"content-type", b"text/plain; charset=utf-8"]]
+            })
+            await cors_send({"type": "http.response.body", "body": b"MCP Server running successfully."})
+        else:
+            await cors_send({
+                "type": "http.response.start",
+                "status": 404,
+                "headers": [[b"content-type", b"text/plain"]]
+            })
+            await cors_send({"type": "http.response.body", "body": b"Not Found"})
+
+if __name__ == "__main__":
+    uvicorn.run(app, host="0.0.0.0", port=7860)
